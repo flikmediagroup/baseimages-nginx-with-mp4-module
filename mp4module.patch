@@ -1,0 +1,157 @@
+Index: bundle/nginx-1.4.3/src/http/modules/ngx_http_mp4_module.c
+===================================================================
+--- bundle/nginx-1.4.3/src/http/modules/ngx_http_mp4_module.c	(revision 126116)
++++ bundle/nginx-1.4.3/src/http/modules/ngx_http_mp4_module.c	(working copy)
+@@ -129,6 +129,7 @@
+     off_t                 end;
+     off_t                 content_length;
+     ngx_uint_t            start;
++    ngx_uint_t            old_start;
+     ngx_uint_t            length;
+     uint32_t              timescale;
+     ngx_http_request_t   *request;
+@@ -2100,6 +2101,51 @@
+ 
+ 
+ static ngx_int_t
++ngx_http_mp4_sync_sample_seek(ngx_http_mp4_file_t *mp4,ngx_http_mp4_trak_t *trak, ngx_uint_t *sample, ngx_uint_t old_sample, uint32_t duration, uint32_t timescale, ngx_uint_t flag)
++{
++    uint32_t     stss_sample, *stss_entry, *stss_end;
++    ngx_buf_t   *stss_data;
++    ngx_uint_t   stss_entries;
++
++    stss_data = trak->out[NGX_HTTP_MP4_STSS_DATA].buf;
++    if (stss_data == NULL)  return -1;
++
++    if ((mp4->start == 0) && (flag == 1)) {
++        return -1;
++    }
++
++    stss_entries = trak->sync_samples_entries;
++    stss_entry = (uint32_t *) stss_data->pos;
++    stss_end = (uint32_t *) stss_data->last;
++
++    while (stss_entry < stss_end) {
++        stss_sample = ngx_mp4_get_32value(stss_entry);
++
++        if (*sample < stss_sample) {
++           *sample = ngx_mp4_get_32value(stss_entry-1) - 1;
++           break;
++        }
++        if (*sample == stss_sample) {
++           *sample = ngx_mp4_get_32value(stss_entry) - 1;
++           break;
++        }
++
++        stss_entries--;
++        stss_entry++;
++    }
++    if (flag == 1) {
++        mp4->start = (*sample * duration) * 1000 / timescale;
++    }
++
++    if (flag == 0) {
++        mp4->length = (*sample - 1) * duration * 1000 / timescale  -  mp4->start;
++    }
++
++    return 0;
++}
++
++
++static ngx_int_t
+ ngx_http_mp4_crop_stts_data(ngx_http_mp4_file_t *mp4,
+     ngx_http_mp4_trak_t *trak, ngx_uint_t start)
+ {
+@@ -2106,19 +2152,19 @@
+     uint32_t               count, duration, rest;
+     uint64_t               start_time;
+     ngx_buf_t             *data;
+-    ngx_uint_t             start_sample, entries, start_sec;
++    ngx_uint_t             start_sample, entries, start_sec, old_start_sample;
+     ngx_mp4_stts_entry_t  *entry, *end;
+ 
+     if (start) {
+         start_sec = mp4->start;
++        mp4->old_start = mp4->start;
+ 
+         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
+                        "mp4 stts crop start_time:%ui", start_sec);
+ 
+     } else if (mp4->length) {
+-        start_sec = mp4->length;
+-
+-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
++       start_sec = mp4->length + mp4->old_start;
++       ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
+                        "mp4 stts crop end_time:%ui", start_sec);
+ 
+     } else {
+@@ -2134,6 +2180,7 @@
+     entry = (ngx_mp4_stts_entry_t *) data->pos;
+     end = (ngx_mp4_stts_entry_t *) data->last;
+ 
++
+     while (entry < end) {
+         count = ngx_mp4_get_32value(entry->count);
+         duration = ngx_mp4_get_32value(entry->duration);
+@@ -2144,6 +2191,10 @@
+ 
+         if (start_time < (uint64_t) count * duration) {
+             start_sample += (ngx_uint_t) (start_time / duration);
++            old_start_sample = start_sample; 
++            ngx_http_mp4_sync_sample_seek(mp4, trak, &start_sample, old_start_sample, duration, trak->timescale, start);
++            start_time = (uint64_t)start_sample * duration;
++
+             rest = (uint32_t) (start_time / duration);
+             goto found;
+         }
+@@ -2183,11 +2234,13 @@
+                        trak->start_sample, count - rest);
+ 
+     } else {
+-        ngx_mp4_set_32value(entry->count, rest);
+         data->last = (u_char *) (entry + 1);
+         trak->time_to_sample_entries -= entries - 1;
+-        trak->end_sample = trak->start_sample + start_sample;
+ 
++        trak->end_sample = start_sample - 1;
++
++        ngx_mp4_set_32value(entry->count, trak->end_sample - trak->start_sample);
++
+         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
+                        "end_sample:%ui, new count:%uD",
+                        trak->end_sample, rest);
+@@ -2297,7 +2350,6 @@
+ 
+     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
+                    "sync sample entries:%uD", trak->sync_samples_entries);
+-
+     if (trak->sync_samples_entries) {
+         entry = (uint32_t *) data->pos;
+         end = (uint32_t *) data->last;
+@@ -2305,8 +2357,10 @@
+         start_sample = trak->start_sample;
+ 
+         while (entry < end) {
++
+             sample = ngx_mp4_get_32value(entry);
+             sample -= start_sample;
++
+             ngx_mp4_set_32value(entry, sample);
+             entry++;
+         }
+@@ -2366,7 +2420,13 @@
+         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
+                        "sync:%uD", sample);
+ 
+-        if (sample >= start_sample) {
++        if (start) {
++            if (sample >= start_sample - 1) {
++               goto found;
++            }
++        }
++
++        if (sample >= start_sample - 1) {
+             goto found;
+         }
+ 
